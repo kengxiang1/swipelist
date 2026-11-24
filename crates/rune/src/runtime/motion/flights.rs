@@ -100,10 +100,10 @@ impl Launches {
 
     /// What this commit mounts, in the order they were asked for. Each launch waits for its
     /// answer (`take_off` or `miss`) before it is over.
-    pub(in crate::runtime) fn commit(&mut self) -> Vec<LaunchEffect> { self.step(LaunchEvent::Commit).into_iter().collect() }
+    fn commit(&mut self) -> Vec<LaunchEffect> { self.step(LaunchEvent::Commit).into_iter().collect() }
 
     /// The destination `attempt` waited for mounted, and `flight` starts at its node.
-    pub(in crate::runtime) fn take_off(&mut self, attempt: Attempt, flight: Launched) {
+    fn take_off(&mut self, attempt: Attempt, flight: Launched) {
         self.step(LaunchEvent::TakeOff { attempt, flight });
     }
 

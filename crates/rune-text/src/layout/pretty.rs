@@ -199,6 +199,7 @@ fn optimal(cands: &[Candidate], fit: f32, line_penalty: f32) -> Vec<usize> {
         let last = end == cands.len() - 1;
         let (mut best, mut best_prev, mut best_hope) = (f32::MAX, 0, 0.0f32);
         let start_edge = cands[end].if_break - fit;
+        let mut next_active = active;
         for start in active..end {
             let start_score = scores[start].0;
             if start_score + best_hope >= best {
@@ -214,7 +215,7 @@ fn optimal(cands: &[Candidate], fit: f32, line_penalty: f32) -> Vec<usize> {
                 width_score = delta * delta;
             }
             if delta < 0.0 {
-                active = start + 1;
+                next_active = start + 1;
             } else {
                 best_hope = width_score;
             }
@@ -224,6 +225,7 @@ fn optimal(cands: &[Candidate], fit: f32, line_penalty: f32) -> Vec<usize> {
                 best_prev = start;
             }
         }
+        active = next_active;
         scores.push((best + cands[end].penalty + line_penalty, best_prev, scores[best_prev].2 + 1));
     }
     let mut out = Vec::new();

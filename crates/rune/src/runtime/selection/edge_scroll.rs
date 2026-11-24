@@ -197,6 +197,7 @@ impl EdgeScroll {
     }
 
     /// Stepping, or about to: not idle, nor resting at an end.
+    #[cfg(test)]
     pub(in crate::runtime) fn running(&self) -> bool { matches!(self.state, State::Running { .. } | State::Laying { .. }) }
 }
 

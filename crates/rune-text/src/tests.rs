@@ -290,7 +290,7 @@ fn system_fonts_include_fontconfig_files() {
 
 #[test]
 fn plex_keyboard_symbols_use_real_glyphs() {
-    const PLEX: &[u8] = include_bytes!("../../../themes/opencode/assets/fonts/IBMPlexMono-Regular.ttf");
+    const PLEX: &[u8] = include_bytes!("../../rune/assets/IBMPlexMono-Regular.ttf");
     let mut ts = TextSystem::new(&[PLEX], ("IBM Plex Mono", "IBM Plex Mono"));
     ts.load_symbol_fonts();
     if ts.symbol_families.is_empty() {
@@ -434,7 +434,7 @@ fn ink_extents(ts: &mut TextSystem, text: &str, style: TextStyle) -> Vec<(f32, f
 /// about cap height, so `⇧` and `⏎` don't shrink and sink next to the font's capitals.
 #[test]
 fn keyboard_symbol_fallbacks_match_cap_height() {
-    const PLEX: &[u8] = include_bytes!("../../../themes/opencode/assets/fonts/IBMPlexMono-Regular.ttf");
+    const PLEX: &[u8] = include_bytes!("../../rune/assets/IBMPlexMono-Regular.ttf");
     let mut ts = TextSystem::new(&[PLEX], ("IBM Plex Mono", "IBM Plex Mono"));
     if !cfg!(target_os = "macos") || system_font_files(&["sfnsttf"]).is_empty() {
         eprintln!("skipping: no macOS system font");

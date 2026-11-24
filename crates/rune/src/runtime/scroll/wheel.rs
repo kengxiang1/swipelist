@@ -70,7 +70,7 @@ impl WheelCurve {
     /// Whether a notch sent it to the viewport's end (`Self::aimed_at_end`).
     pub(crate) fn to_end(&self) -> bool { self.to_end }
 
-    /// A notch sent it to 	o: the viewport's end when `at_end`.
+    /// A notch sent it to `to`: the viewport's end when `at_end`.
     pub(crate) fn aimed_at_end(&mut self, at_end: bool) { self.to_end = at_end; }
 
     /// The offset now.

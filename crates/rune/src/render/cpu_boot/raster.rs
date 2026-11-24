@@ -23,7 +23,7 @@ use crate::render::{Instance, Kind};
 
 const TILE_PX: usize = (TILE_W * TILE_H) as usize;
 
-/// Paints 	iles on xec's threads; backdrop blurs, taken between phases, go on wide's.
+/// Paints tiles on exec's threads; backdrop blurs, taken between phases, go on wide's.
 pub(super) fn run(scene: &Scene<'_>, bins: &Bins, target: &mut Target<'_>, tiles: &[u32], exec: &dyn Exec, wide: &dyn Exec) -> Report {
     let surface = Surface { base: target.pixels.as_mut_ptr(), len: target.pixels.len(), stride: target.stride };
     let clear = scene.clear.map(|c| c.clamp(0.0, 1.0) * 255.0);

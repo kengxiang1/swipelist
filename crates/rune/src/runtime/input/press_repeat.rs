@@ -50,7 +50,7 @@ pub(in crate::runtime) enum Effect {
     WakeAt(f64),
 }
 
-pub(in crate::runtime) fn step(seq: &mut Seq, state: &mut Repeat, event: Event) -> Effects<Effect> {
+fn step(seq: &mut Seq, state: &mut Repeat, event: Event) -> Effects<Effect> {
     match event {
         Event::Arm { path, due } => {
             let attempt = seq.next();

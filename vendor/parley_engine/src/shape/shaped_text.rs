@@ -105,6 +105,7 @@ impl FontMetrics {
             });
             return metrics;
         }
+        #[cfg(not(feature = "std"))]
         Self::compute_from_font_instance(font, font_size, variations)
     }
 
