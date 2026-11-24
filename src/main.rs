@@ -154,6 +154,7 @@ enum AsyncResult {
 }
 
 struct CoverJob {
+    req_key: String,
     id: String,
     is_playlist: bool,
     image_url: Option<String>,
@@ -161,9 +162,10 @@ struct CoverJob {
 }
 
 struct CoverLoaded {
+    req_key: String,
     id: String,
     is_playlist: bool,
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
 }
 
 struct AudioLoaded {
@@ -199,6 +201,7 @@ struct State {
 
     // Active Swipe Deck
     tracks: Vec<Track>,
+    unshuffled_order: Vec<String>,
     current_index: usize,
     shuffled: bool,
     history: Vec<HistoryEntry>,
@@ -223,6 +226,7 @@ struct State {
     track_covers: HashMap<String, Image>,
     playlist_covers: HashMap<String, Image>,
     requested_covers: HashSet<String>,
+    cover_failures: HashMap<String, u8>,
     cover_tx: Option<Sender<CoverJob>>,
     cover_rx: Option<Receiver<CoverLoaded>>,
 
@@ -261,6 +265,7 @@ impl Default for State {
         let playlists = starter_playlists();
         let source = playlists[0].clone();
         let all_tracks = starter_tracks_for(&source.id);
+        let unshuffled_order: Vec<String> = all_tracks.iter().map(|t| t.id.clone()).collect();
 
         let selected_tracks = vec![
             all_tracks[0].clone(),
@@ -306,6 +311,7 @@ impl Default for State {
             search_edit: TextEdit::new(""),
 
             tracks: all_tracks,
+            unshuffled_order,
             current_index: 3,
             shuffled: false,
             history,
@@ -327,6 +333,7 @@ impl Default for State {
             track_covers: HashMap::new(),
             playlist_covers: HashMap::new(),
             requested_covers: HashSet::new(),
+            cover_failures: HashMap::new(),
             cover_tx: None,
             cover_rx: None,
 
@@ -532,7 +539,7 @@ impl State {
 
     /// Saves current playlist session progress automatically to `swipelist_progress.json`.
     fn auto_save_progress(&mut self) {
-        if rune::tooling::headless_run().is_some() {
+        if cfg!(test) || rune::tooling::headless_run().is_some() {
             return;
         }
         let pid = self.source_playlist.id.clone();
@@ -573,13 +580,13 @@ impl State {
         let mut idx = saved.current_index.min(self.tracks.len());
         if let Some(last) = self.history.last() {
             let expected_prev = idx.checked_sub(1).and_then(|i| self.tracks.get(i));
-            if expected_prev.map(|t| t.id.as_str()) != Some(last.track.id.as_str()) {
-                if let Some(found) = self.tracks.iter().position(|t| t.id == last.track.id) {
-                    idx = (found + 1).min(self.tracks.len());
-                }
+            if expected_prev.map(|t| t.id.as_str()) != Some(last.track.id.as_str())
+                && let Some(found) = self.tracks.iter().position(|t| t.id == last.track.id)
+            {
+                idx = (found + 1).min(self.tracks.len());
             }
         }
-        self.current_index = idx.min(self.tracks.len().saturating_sub(1));
+        self.current_index = idx.min(self.tracks.len());
         if !saved.new_playlist_name.trim().is_empty() {
             self.new_playlist_name.replace_text(&saved.new_playlist_name);
         }
@@ -612,6 +619,28 @@ impl State {
         self.auto_save_progress();
     }
 
+    /// Records a failed cover download attempt and removes `req_key` from `requested_covers`
+    /// once so a transient error can be retried once without looping infinitely.
+    fn record_cover_failure(
+        cover_failures: &mut HashMap<String, u8>,
+        requested_covers: &mut HashSet<String>,
+        req_key: &str,
+    ) -> bool {
+        let next_count = cover_failures
+            .get(req_key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if next_count < 2 {
+            cover_failures.insert(req_key.to_string(), next_count);
+            requested_covers.remove(req_key);
+            true
+        } else {
+            cover_failures.remove(req_key);
+            false
+        }
+    }
+
     /// Queues background cover-art downloads for user avatar, visible cards, selected songs, and source playlists.
     fn queue_visible_covers(&mut self) {
         let Some(tx) = &self.cover_tx else {
@@ -623,9 +652,9 @@ impl State {
             && let Some(url) = &user.image_url
         {
             let key = format!("avatar:{}", user.id);
-            if !self.requested_covers.contains(&key) {
-                self.requested_covers.insert(key);
+            if self.requested_covers.insert(key.clone()) {
                 let _ = tx.send(CoverJob {
+                    req_key: key,
                     id: "__user_avatar__".to_string(),
                     is_playlist: false,
                     image_url: Some(url.clone()),
@@ -638,9 +667,9 @@ impl State {
         for i in self.current_index..=(self.current_index + 5).min(self.tracks.len().saturating_sub(1)) {
             if let Some(t) = self.tracks.get(i) {
                 let key = format!("track:{}", t.id);
-                if !self.requested_covers.contains(&key) {
-                    self.requested_covers.insert(key);
+                if self.requested_covers.insert(key.clone()) {
                     let _ = tx.send(CoverJob {
+                        req_key: key,
                         id: t.id.clone(),
                         is_playlist: false,
                         image_url: t.image_url.clone(),
@@ -653,9 +682,9 @@ impl State {
         // 2. Selected songs
         for t in &self.selected_tracks {
             let key = format!("track:{}", t.id);
-            if !self.requested_covers.contains(&key) {
-                self.requested_covers.insert(key);
+            if self.requested_covers.insert(key.clone()) {
                 let _ = tx.send(CoverJob {
+                    req_key: key,
                     id: t.id.clone(),
                     is_playlist: false,
                     image_url: t.image_url.clone(),
@@ -668,9 +697,9 @@ impl State {
         for pl in &self.playlists {
             if pl.image_url.is_some() {
                 let key = format!("playlist:{}", pl.id);
-                if !self.requested_covers.contains(&key) {
-                    self.requested_covers.insert(key);
+                if self.requested_covers.insert(key.clone()) {
                     let _ = tx.send(CoverJob {
+                        req_key: key,
                         id: pl.id.clone(),
                         is_playlist: true,
                         image_url: pl.image_url.clone(),
@@ -827,6 +856,7 @@ impl State {
         self.history.clear();
         self.selected_tracks.clear();
         self.current_index = 0;
+        self.shuffled = false;
 
         let is_starter_demo = matches!(
             playlist.id.as_str(),
@@ -849,6 +879,8 @@ impl State {
             });
         } else {
             self.tracks = starter_tracks_for(&playlist.id);
+            self.unshuffled_order = self.tracks.iter().map(|t| t.id.clone()).collect();
+            self.shuffled = false;
             self.restore_progress_for_current_playlist();
             self.auto_save_progress();
             self.queue_visible_covers();
@@ -859,8 +891,33 @@ impl State {
     fn toggle_shuffle(&mut self) {
         self.shuffled = !self.shuffled;
         if self.current_index + 1 < self.tracks.len() {
-            let tail = &mut self.tracks[self.current_index + 1..];
-            tail.reverse();
+            if self.shuffled {
+                let mut rng = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+                    ^ (self as *const State as usize as u64);
+                if rng == 0 {
+                    rng = 0x9e37_79b9_7f4a_7c15;
+                }
+                let tail = &mut self.tracks[self.current_index + 1..];
+                for i in (1..tail.len()).rev() {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let j = (rng as usize) % (i + 1);
+                    tail.swap(i, j);
+                }
+            } else {
+                let pos_map: HashMap<&str, usize> = self
+                    .unshuffled_order
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, id)| (id.as_str(), idx))
+                    .collect();
+                let tail = &mut self.tracks[self.current_index + 1..];
+                tail.sort_by_key(|t| pos_map.get(t.id.as_str()).copied().unwrap_or(usize::MAX));
+            }
         }
         self.queue_visible_covers();
     }
@@ -989,17 +1046,17 @@ fn setup(s: &mut State, waker: rune::runtime::Waker) {
     let cover_waker = waker.clone();
     std::thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
-            if let Some(bytes) = fetch_cover_bytes(
+            let bytes = fetch_cover_bytes(
                 job.image_url.as_deref(),
                 job.spotify_track_id.as_deref(),
-            ) {
-                let _ = done_tx.send(CoverLoaded {
-                    id: job.id,
-                    is_playlist: job.is_playlist,
-                    bytes,
-                });
-                cover_waker();
-            }
+            );
+            let _ = done_tx.send(CoverLoaded {
+                req_key: job.req_key,
+                id: job.id,
+                is_playlist: job.is_playlist,
+                bytes,
+            });
+            cover_waker();
         }
     });
     s.cover_tx = Some(job_tx);
@@ -1049,18 +1106,31 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     }
 
     // 1. Drain newly downloaded cover art bytes into Rune's GPU ImageCache
+    let mut retry_covers = false;
     if let (Some(rx), Some(cache)) = (&s.cover_rx, &s.image_cache) {
         while let Ok(loaded) = rx.try_recv() {
-            let img = cache.load(loaded.bytes);
-            if loaded.id == "__user_avatar__" {
-                s.user_avatar = Some(img);
-            } else if loaded.is_playlist {
-                s.playlist_covers.insert(loaded.id, img);
-            } else {
-                s.track_covers.insert(loaded.id, img);
+            if let Some(bytes) = loaded.bytes {
+                let img = cache.load(bytes);
+                if loaded.id == "__user_avatar__" {
+                    s.user_avatar = Some(img);
+                } else if loaded.is_playlist {
+                    s.playlist_covers.insert(loaded.id, img);
+                } else {
+                    s.track_covers.insert(loaded.id, img);
+                }
+                s.cover_failures.remove(&loaded.req_key);
+                changed = true;
+            } else if State::record_cover_failure(
+                &mut s.cover_failures,
+                &mut s.requested_covers,
+                &loaded.req_key,
+            ) {
+                retry_covers = true;
             }
-            changed = true;
         }
+    }
+    if retry_covers {
+        s.queue_visible_covers();
     }
 
     // 2. Drain newly downloaded audio MP3 file and start Rune's native audio Player
@@ -1186,7 +1256,9 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                         item.track_count = tracks.len();
                     }
                     s.tracks = tracks;
+                    s.unshuffled_order = s.tracks.iter().map(|t| t.id.clone()).collect();
                     s.current_index = 0;
+                    s.shuffled = false;
                     s.restore_progress_for_current_playlist();
                     s.auto_save_progress();
                     s.queue_visible_covers();
@@ -2182,7 +2254,18 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
         let y3 = (-28.0 + drag_ratio * 14.0) * m.scale;
         let o3 = 0.42 + drag_ratio * 0.28;
         arena = arena.child(
-            tinder_track_card(s, t3, s.current_index + 2, total, 0.0, p, m, false)
+            tinder_track_card(
+                s,
+                TrackCardProps {
+                    track: t3,
+                    index: s.current_index + 2,
+                    total,
+                    drag_dx: 0.0,
+                    is_top: false,
+                },
+                p,
+                m,
+            )
                 .key(format!("deck-card-{}-{}", s.current_index + 2, t3.id))
                 .absolute(0.0, 0.0)
                 .paint_order(1)
@@ -2200,7 +2283,18 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
         let y2 = (-14.0 + drag_ratio * 14.0) * m.scale;
         let o2 = 0.74 + drag_ratio * 0.26;
         arena = arena.child(
-            tinder_track_card(s, t2, s.current_index + 1, total, 0.0, p, m, false)
+            tinder_track_card(
+                s,
+                TrackCardProps {
+                    track: t2,
+                    index: s.current_index + 1,
+                    total,
+                    drag_dx: 0.0,
+                    is_top: false,
+                },
+                p,
+                m,
+            )
                 .key(format!("deck-card-{}-{}", s.current_index + 1, t2.id))
                 .absolute(0.0, 0.0)
                 .paint_order(2)
@@ -2216,7 +2310,18 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
     let active_track_id_drag = active_track.id.clone();
     let tilt_sign = if s.drag_pivot_top { 1.0 } else { -0.75 };
     let tilt_rad = (s.drag_dx * 0.0010 * tilt_sign).clamp(-0.35, 0.35);
-    let top_card = tinder_track_card(s, active_track, s.current_index, total, s.drag_dx, p, m, true)
+    let top_card = tinder_track_card(
+        s,
+        TrackCardProps {
+            track: active_track,
+            index: s.current_index,
+            total,
+            drag_dx: s.drag_dx,
+            is_top: true,
+        },
+        p,
+        m,
+    )
         .key(format!("deck-card-{}-{}", s.current_index, active_track.id))
         .absolute(0.0, 0.0)
         .paint_order(3)
@@ -2282,7 +2387,18 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
             SwipeDecision::Skip => (-exit_dist, -0.26, -120.0),
         };
         arena = arena.child(
-            tinder_track_card(s, &exit.track, exit.index, total, stamp_dx, p, m, true)
+            tinder_track_card(
+                s,
+                TrackCardProps {
+                    track: &exit.track,
+                    index: exit.index,
+                    total,
+                    drag_dx: stamp_dx,
+                    is_top: true,
+                },
+                p,
+                m,
+            )
                 .key(format!("deck-card-{}-{}", exit.index, exit.track.id))
                 .absolute(0.0, 0.0)
                 .paint_order(4)
@@ -2526,18 +2642,29 @@ fn kbd_hint(key_label: &str, action_label: &str, p: &Palette) -> El {
         )
 }
 
+struct TrackCardProps<'a> {
+    track: &'a Track,
+    index: usize,
+    total: usize,
+    drag_dx: f32,
+    is_top: bool,
+}
+
 /// Builds a single Tinder-style full-bleed track card (`380 × 515` pt) with real album cover art,
 /// Play/Pause toggle, and a draggable player slider.
 fn tinder_track_card(
     s: &State,
-    track: &Track,
-    index: usize,
-    total: usize,
-    drag_dx: f32,
+    props: TrackCardProps<'_>,
     p: &Palette,
     m: &LayoutMetrics,
-    is_top: bool,
 ) -> El {
+    let TrackCardProps {
+        track,
+        index,
+        total,
+        drag_dx,
+        is_top,
+    } = props;
     let hue = track.accent_hue;
     let add_opacity = if is_top {
         (drag_dx / 70.0).clamp(0.0, 1.0)
@@ -4107,4 +4234,133 @@ fn main() {
         ],
         ..AppSpec::new("Swipelist", WINDOW_SIZE, State::default, view)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shuffle_and_restore_preserves_prefix_and_original_order() {
+        let mut s = State::default();
+        let all_ids: Vec<String> = s.tracks.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(s.unshuffled_order, all_ids);
+        assert!(!s.shuffled);
+
+        let prefix_before: Vec<String> = s.tracks[..=s.current_index]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        let mut expected_tail_sorted: Vec<String> = s.tracks[s.current_index + 1..]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        expected_tail_sorted.sort();
+
+        s.toggle_shuffle();
+        assert!(s.shuffled);
+
+        let prefix_after_shuffle: Vec<String> = s.tracks[..=s.current_index]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(prefix_after_shuffle, prefix_before);
+
+        let mut actual_tail_sorted: Vec<String> = s.tracks[s.current_index + 1..]
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        actual_tail_sorted.sort();
+        assert_eq!(actual_tail_sorted, expected_tail_sorted);
+
+        // Simulate advancing past one more track while shuffled
+        if s.current_index + 1 < s.tracks.len() {
+            s.current_index += 1;
+        }
+        let active_id_before_unshuffle = s.tracks.get(s.current_index).map(|t| t.id.clone());
+
+        s.toggle_shuffle();
+        assert!(!s.shuffled);
+        assert_eq!(
+            s.tracks.get(s.current_index).map(|t| t.id.clone()),
+            active_id_before_unshuffle
+        );
+
+        let restored_tail_positions: Vec<usize> = s.tracks[s.current_index + 1..]
+            .iter()
+            .filter_map(|t| s.unshuffled_order.iter().position(|id| id == &t.id))
+            .collect();
+        assert_eq!(restored_tail_positions.len(), s.tracks.len() - s.current_index - 1);
+        assert!(restored_tail_positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn select_source_playlist_resets_shuffle_and_updates_order() {
+        let mut s = State::default();
+        s.toggle_shuffle();
+        assert!(s.shuffled);
+
+        let next_pl = s.playlists[1].clone();
+        s.select_source_playlist(next_pl);
+        assert!(!s.shuffled);
+
+        let track_ids: Vec<String> = s.tracks.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(s.unshuffled_order, track_ids);
+    }
+
+    #[test]
+    fn restore_progress_preserves_completed_deck() {
+        let mut s = State::default();
+        let total = s.tracks.len();
+        assert!(total > 0);
+        let last_track = s.tracks[total - 1].clone();
+
+        let entry = PlaylistProgress {
+            playlist_id: s.source_playlist.id.clone(),
+            playlist_name: s.source_playlist.name.clone(),
+            current_index: total,
+            total_tracks: total,
+            new_playlist_name: "Saved Name".to_string(),
+            new_playlist_desc: "Saved Desc".to_string(),
+            is_public: false,
+            custom_cover_path: None,
+            selected_tracks: vec![last_track.clone()],
+            history: vec![HistoryEntry {
+                track: last_track,
+                decision: SwipeDecision::Add,
+                index: total - 1,
+            }],
+        };
+        s.progress_store
+            .sessions
+            .insert(s.source_playlist.id.clone(), entry);
+
+        assert!(s.restore_progress_for_current_playlist());
+        assert_eq!(s.current_index, total);
+        assert!(s.current_track().is_none());
+    }
+
+    #[test]
+    fn cover_failure_retries_once_and_stops() {
+        let mut s = State::default();
+        let key = "track:demo-1".to_string();
+        s.requested_covers.insert(key.clone());
+
+        assert!(State::record_cover_failure(
+            &mut s.cover_failures,
+            &mut s.requested_covers,
+            &key
+        ));
+        assert!(!s.requested_covers.contains(&key));
+        assert_eq!(s.cover_failures.get(&key).copied(), Some(1));
+
+        s.requested_covers.insert(key.clone());
+        assert!(!State::record_cover_failure(
+            &mut s.cover_failures,
+            &mut s.requested_covers,
+            &key
+        ));
+        assert!(s.requested_covers.contains(&key));
+        assert!(!s.cover_failures.contains_key(&key));
+    }
 }

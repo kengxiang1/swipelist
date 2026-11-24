@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -72,7 +73,6 @@ pub struct PlaylistSummary {
 pub struct UserProfile {
     pub id: String,
     pub display_name: String,
-    pub product: String,
     #[serde(default)]
     pub image_url: Option<String>,
 }
@@ -131,7 +131,7 @@ fn app_data_dir() -> PathBuf {
     dir
 }
 
-pub fn local_progress_file_path() -> PathBuf {
+fn local_progress_file_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| app_data_dir())
         .join("swipelist_progress.json")
@@ -142,14 +142,14 @@ fn appdata_progress_file_path() -> PathBuf {
 }
 
 pub fn load_progress_store() -> ProgressStore {
-    let local = local_progress_file_path();
-    if let Ok(raw) = std::fs::read_to_string(&local)
+    let appdata = appdata_progress_file_path();
+    if let Ok(raw) = std::fs::read_to_string(&appdata)
         && let Ok(store) = serde_json::from_str::<ProgressStore>(&raw)
     {
         return store;
     }
-    let appdata = appdata_progress_file_path();
-    std::fs::read_to_string(appdata)
+    let local = local_progress_file_path();
+    std::fs::read_to_string(local)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -157,7 +157,6 @@ pub fn load_progress_store() -> ProgressStore {
 
 pub fn save_progress_store(store: &ProgressStore) {
     if let Ok(json) = serde_json::to_string_pretty(store) {
-        let _ = std::fs::write(local_progress_file_path(), &json);
         let _ = std::fs::write(appdata_progress_file_path(), &json);
     }
 }
@@ -200,17 +199,21 @@ pub fn fetch_cover_bytes(image_url: Option<&str>, spotify_track_id: Option<&str>
     // Resolve URL if only a Spotify track ID was available
     let resolved_url = if let Some(u) = image_url.filter(|u| !u.is_empty()) {
         u.to_string()
-    } else if let Some(tid) = spotify_track_id.filter(|id| !id.starts_with("demo-")) {
-        let oembed_url = format!("https://open.spotify.com/oembed?url=https://open.spotify.com/track/{tid}");
-        let raw = run_curl(&["-L", &oembed_url], None).ok()?;
+    } else {
+        let tid = spotify_track_id.filter(|id| !id.starts_with("demo-"))?;
+        let oembed_url = format!(
+            "https://open.spotify.com/oembed?url=https://open.spotify.com/track/{}",
+            url_encode(tid)
+        );
+        validate_https_url(&oembed_url).ok()?;
+        let raw = run_curl(&oembed_url, &["-L"], None, None).ok()?;
         let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
         val["thumbnail_url"].as_str()?.to_string()
-    } else {
-        return None;
     };
 
+    validate_https_url(&resolved_url).ok()?;
     let cache_str = cache_file.to_string_lossy().into_owned();
-    let _ = run_curl(&["-L", "-o", &cache_str, &resolved_url], None).ok()?;
+    run_curl(&resolved_url, &["-L", "-o", &cache_str], None, None).ok()?;
     let bytes = std::fs::read(&cache_file).ok()?;
     if bytes.len() > 256 {
         Some(bytes)
@@ -238,14 +241,16 @@ pub fn fetch_track_audio_file(track: &Track) -> Result<PathBuf, String> {
     let preview_url = if let Some(u) = track.preview_url.as_deref().filter(|u| !u.is_empty()) {
         u.to_string()
     } else {
-        let embed_url = format!("https://open.spotify.com/embed/track/{tid}");
-        let html = run_curl(&["-L", &embed_url], None)?;
+        let embed_url = format!("https://open.spotify.com/embed/track/{}", url_encode(tid));
+        validate_https_url(&embed_url)?;
+        let html = run_curl(&embed_url, &["-L"], None, None)?;
         extract_audio_preview_from_embed(&html)
             .ok_or_else(|| format!("No audio stream available for \"{}\".", track.name))?
     };
 
+    validate_https_url(&preview_url)?;
     let out_str = mp3_path.to_string_lossy().into_owned();
-    run_curl(&["-L", "-o", &out_str, &preview_url], None)?;
+    run_curl(&preview_url, &["-L", "-o", &out_str], None, None)?;
 
     let len = std::fs::metadata(&mp3_path).map(|m| m.len()).unwrap_or(0);
     if len <= 1024 {
@@ -303,7 +308,21 @@ pub fn load_config() -> StoredConfig {
 pub fn save_config(cfg: &StoredConfig) {
     let path = config_file_path();
     if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(path, json);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut file) = opts.open(&path) {
+            let _ = file.write_all(json.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
     }
 }
 
@@ -790,10 +809,12 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    let (chunks, _) = padded.as_chunks::<64>();
+    for chunk in chunks {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = chunk.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -912,6 +933,49 @@ pub struct PkceRequest {
     pub auth_url: String,
 }
 
+#[cfg(target_os = "windows")]
+fn fill_os_random(buf: &mut [u8]) -> Result<(), String> {
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut std::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let len = u32::try_from(buf.len())
+        .map_err(|_| "Requested random buffer size exceeds u32::MAX".to_string())?;
+    // SAFETY: `buf.as_mut_ptr()` points to `len` writable bytes because `len == buf.len()`,
+    // and `BCRYPT_USE_SYSTEM_PREFERRED_RNG` accepts a null `h_algorithm` handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            len,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(format!("OS CSPRNG (BCryptGenRandom) failed with status {status:#x}"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fill_os_random(buf: &mut [u8]) -> Result<(), String> {
+    let mut file = std::fs::File::open("/dev/urandom")
+        .map_err(|e| format!("Failed to open /dev/urandom: {e}"))?;
+    file.read_exact(buf)
+        .map_err(|e| format!("Failed to read random bytes from /dev/urandom: {e}"))
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn fill_os_random(_buf: &mut [u8]) -> Result<(), String> {
+    Err("OS CSPRNG is not supported on this platform".into())
+}
+
 /// Generates a fresh OAuth 2.0 PKCE verifier, state, and Spotify authorization URL.
 pub fn prepare_pkce_request(client_id: &str) -> Result<PkceRequest, String> {
     let client_id = client_id.trim();
@@ -922,19 +986,13 @@ pub fn prepare_pkce_request(client_id: &str) -> Result<PkceRequest, String> {
         return Err("Client ID must be a valid alphanumeric string from Spotify Developer Dashboard.".into());
     }
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id();
-    let seed = format!("swipelist-pkce-{nanos}-{pid}");
-    let h1 = sha256(seed.as_bytes());
-    let h2 = sha256(&h1);
-    let mut combined = [0u8; 48];
-    combined[..32].copy_from_slice(&h1);
-    combined[32..].copy_from_slice(&h2[..16]);
-    let verifier = base64_url_encode(&combined);
-    let state = base64_url_encode(&h2[16..28]);
+    let mut verifier_bytes = [0u8; 48];
+    fill_os_random(&mut verifier_bytes)?;
+    let mut state_bytes = [0u8; 16];
+    fill_os_random(&mut state_bytes)?;
+
+    let verifier = base64_url_encode(&verifier_bytes);
+    let state = base64_url_encode(&state_bytes);
     let challenge = base64_url_encode(&sha256(verifier.as_bytes()));
 
     let scopes = "playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public user-library-read user-read-private ugc-image-upload";
@@ -957,24 +1015,110 @@ pub fn prepare_pkce_request(client_id: &str) -> Result<PkceRequest, String> {
 }
 
 pub fn cancel_pending_oauth_listener() {
-    if let Ok(mut stream) = TcpStream::connect_timeout(
-        &"127.0.0.1:8888".parse().unwrap(),
-        Duration::from_millis(120),
-    ) {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8888));
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(120)) {
         let _ = stream.write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1:8888\r\n\r\n");
         let _ = stream.flush();
     }
 }
 
-fn run_curl(args: &[&str], body: Option<&[u8]>) -> Result<String, String> {
+pub(crate) fn validate_https_url(url: &str) -> Result<(), String> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err("Only HTTPS URLs are permitted.".into());
+    };
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("URL contains invalid whitespace or control characters.".into());
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Err("URL must include a non-empty host.".into());
+    }
+    Ok(())
+}
+
+fn validate_spotify_api_url(url: &str) -> Result<(), String> {
+    validate_https_url(url)?;
+    if !url.starts_with("https://api.spotify.com/") {
+        return Err("Refusing unexpected non-Spotify API URL.".into());
+    }
+    Ok(())
+}
+
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn run_curl(
+    url: &str,
+    args: &[&str],
+    auth_token: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<String, String> {
+    validate_https_url(url)?;
+
     let mut cmd = Command::new("curl");
-    cmd.args(["-s", "-S"]);
+    cmd.args([
+        "-s",
+        "-S",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "60",
+    ]);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.arg("--ssl-no-revoke");
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+
+    let _auth_guard = if let Some(token) = auth_token {
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '"' | '\\'))
+        {
+            return Err("Invalid authorization token format.".into());
+        }
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cfg_path = app_data_dir().join(format!("curl_auth_{}_{seq}.cfg", std::process::id()));
+        let guard = TempFileGuard(cfg_path.clone());
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(&cfg_path)
+            .map_err(|e| format!("Failed to create curl auth config: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to secure curl auth config: {e}"))?;
+        }
+        writeln!(file, "header = \"Authorization: Bearer {token}\"")
+            .map_err(|e| format!("Failed to write curl auth config: {e}"))?;
+        file.flush()
+            .map_err(|e| format!("Failed to flush curl auth config: {e}"))?;
+
+        cmd.arg("-K").arg(&cfg_path);
+        Some(guard)
+    } else {
+        None
+    };
+
     cmd.args(args);
 
     if body.is_some() {
@@ -983,6 +1127,7 @@ fn run_curl(args: &[&str], body: Option<&[u8]>) -> Result<String, String> {
     } else {
         cmd.stdin(Stdio::null());
     }
+    cmd.arg("--").arg(url);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -1079,9 +1224,7 @@ pub fn exchange_callback_query(
         }
     }
 
-    if let Some(st) = &returned_state
-        && st != &req.state
-    {
+    if returned_state.as_deref() != Some(req.state.as_str()) {
         return Err("OAuth security state mismatch. Please click Authorize with Spotify again.".into());
     }
 
@@ -1098,13 +1241,14 @@ pub fn exchange_callback_query(
     );
 
     let token_raw = run_curl(
+        "https://accounts.spotify.com/api/token",
         &[
             "-X",
             "POST",
-            "https://accounts.spotify.com/api/token",
             "-H",
             "Content-Type: application/x-www-form-urlencoded",
         ],
+        None,
         Some(form.as_bytes()),
     )?;
 
@@ -1135,6 +1279,61 @@ pub fn exchange_callback_query(
     })
 }
 
+fn refresh_access_token() -> Result<String, String> {
+    let cfg = load_config();
+    if cfg.client_id.trim().is_empty() {
+        return Err("No saved Client ID".into());
+    }
+
+    let refresh = cfg
+        .refresh_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "No saved refresh token".to_string())?;
+
+    let form = format!(
+        "client_id={}&grant_type=refresh_token&refresh_token={}",
+        url_encode(cfg.client_id.trim()),
+        url_encode(refresh),
+    );
+
+    let token_raw = run_curl(
+        "https://accounts.spotify.com/api/token",
+        &[
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/x-www-form-urlencoded",
+        ],
+        None,
+        Some(form.as_bytes()),
+    )?;
+
+    let token_json: serde_json::Value =
+        serde_json::from_str(&token_raw).map_err(|_| "Invalid refresh token JSON".to_string())?;
+
+    if let Some(err_desc) = token_json["error_description"].as_str() {
+        return Err(format!("Spotify token refresh error: {err_desc}"));
+    }
+
+    let access_token = token_json["access_token"]
+        .as_str()
+        .ok_or_else(|| "Refresh token expired".to_string())?
+        .to_string();
+    let new_refresh = token_json["refresh_token"]
+        .as_str()
+        .map(String::from)
+        .or(cfg.refresh_token);
+
+    save_config(&StoredConfig {
+        client_id: cfg.client_id,
+        refresh_token: new_refresh,
+        access_token: Some(access_token.clone()),
+    });
+
+    Ok(access_token)
+}
+
 pub fn restore_saved_session() -> Result<SpotifyAuthSession, String> {
     let cfg = load_config();
     if cfg.client_id.trim().is_empty() {
@@ -1152,47 +1351,7 @@ pub fn restore_saved_session() -> Result<SpotifyAuthSession, String> {
         });
     }
 
-    let refresh = cfg
-        .refresh_token
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "No saved refresh token".to_string())?;
-
-    let form = format!(
-        "client_id={}&grant_type=refresh_token&refresh_token={}",
-        url_encode(cfg.client_id.trim()),
-        url_encode(refresh),
-    );
-
-    let token_raw = run_curl(
-        &[
-            "-X",
-            "POST",
-            "https://accounts.spotify.com/api/token",
-            "-H",
-            "Content-Type: application/x-www-form-urlencoded",
-        ],
-        Some(form.as_bytes()),
-    )?;
-
-    let token_json: serde_json::Value =
-        serde_json::from_str(&token_raw).map_err(|_| "Invalid refresh token JSON".to_string())?;
-
-    let access_token = token_json["access_token"]
-        .as_str()
-        .ok_or_else(|| "Refresh token expired".to_string())?
-        .to_string();
-    let new_refresh = token_json["refresh_token"]
-        .as_str()
-        .map(String::from)
-        .or(cfg.refresh_token);
-
-    save_config(&StoredConfig {
-        client_id: cfg.client_id,
-        refresh_token: new_refresh,
-        access_token: Some(access_token.clone()),
-    });
-
+    let access_token = refresh_access_token()?;
     let (user, playlists) = fetch_profile_and_playlists(&access_token)?;
     Ok(SpotifyAuthSession {
         user,
@@ -1201,17 +1360,91 @@ pub fn restore_saved_session() -> Result<SpotifyAuthSession, String> {
     })
 }
 
+fn parse_spotify_error(val: &serde_json::Value) -> Option<(Option<u64>, String)> {
+    let err = val.get("error")?;
+    if err.is_null() {
+        return None;
+    }
+    let status = err.get("status").and_then(|s| s.as_u64());
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| err.as_str())
+        .unwrap_or("Unknown Spotify API error")
+        .to_string();
+    Some((status, msg))
+}
+
+fn spotify_api_request(
+    method: Option<&str>,
+    url: &str,
+    content_type: Option<&str>,
+    token: &mut String,
+    body: Option<&[u8]>,
+    allow_empty: bool,
+) -> Result<serde_json::Value, String> {
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(m) = method {
+        args.push("-X");
+        args.push(m);
+    }
+    let ct_header = content_type.map(|ct| format!("Content-Type: {ct}"));
+    if let Some(ref h) = ct_header {
+        args.push("-H");
+        args.push(h.as_str());
+    }
+
+    let mut refreshed = false;
+    loop {
+        let raw = run_curl(url, &args, Some(token.as_str()), body)?;
+        if raw.trim().is_empty() {
+            if allow_empty {
+                return Ok(serde_json::Value::Null);
+            }
+            return Err("Empty response from Spotify API.".into());
+        }
+        let val: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| format!("Invalid JSON from Spotify API: {raw}"))?;
+
+        if let Some((status, msg)) = parse_spotify_error(&val) {
+            if status == Some(401) && !refreshed {
+                refreshed = true;
+                *token = refresh_access_token()
+                    .map_err(|e| format!("Spotify API error (401): {e}"))?;
+                continue;
+            }
+            let code_label = status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            return Err(format!("Spotify API error ({code_label}): {msg}"));
+        }
+
+        return Ok(val);
+    }
+}
+
+fn spotify_api_json(
+    method: Option<&str>,
+    url: &str,
+    token: &mut String,
+    body: Option<&[u8]>,
+) -> Result<serde_json::Value, String> {
+    let ct = body.map(|_| "application/json");
+    spotify_api_request(method, url, ct, token, body, false)
+}
+
 pub fn fetch_profile_and_playlists(
     access_token: &str,
 ) -> Result<(UserProfile, Vec<PlaylistSummary>), String> {
-    let auth_header = format!("Authorization: Bearer {access_token}");
-    let me_raw = run_curl(&["https://api.spotify.com/v1/me", "-H", &auth_header], None)?;
+    let me_raw = run_curl("https://api.spotify.com/v1/me", &[], Some(access_token), None)?;
     let me: serde_json::Value =
         serde_json::from_str(&me_raw).map_err(|_| format!("Invalid profile JSON: {me_raw}"))?;
 
-    if let Some(err) = me.get("error") {
-        let msg = err["message"].as_str().unwrap_or("Unauthorized");
-        return Err(format!("Spotify API error: {msg}"));
+    if let Some((status, msg)) = parse_spotify_error(&me) {
+        let code_label = status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        return Err(format!("Spotify API error ({code_label}): {msg}"));
     }
 
     let user = UserProfile {
@@ -1221,7 +1454,6 @@ pub fn fetch_profile_and_playlists(
             .or_else(|| me["id"].as_str())
             .unwrap_or("Spotify User")
             .to_string(),
-        product: me["product"].as_str().unwrap_or("premium").to_uppercase(),
         image_url: me["images"]
             .as_array()
             .and_then(|arr| arr.first())
@@ -1232,11 +1464,9 @@ pub fn fetch_profile_and_playlists(
     let mut list = Vec::new();
 
     if let Ok(liked_raw) = run_curl(
-        &[
-            "https://api.spotify.com/v1/me/tracks?limit=1",
-            "-H",
-            &auth_header,
-        ],
+        "https://api.spotify.com/v1/me/tracks?limit=1",
+        &[],
+        Some(access_token),
         None,
     ) && let Ok(liked_val) = serde_json::from_str::<serde_json::Value>(&liked_raw)
         && let Some(total) = liked_val["total"].as_u64()
@@ -1258,7 +1488,8 @@ pub fn fetch_profile_and_playlists(
         Some("https://api.spotify.com/v1/me/playlists?limit=50".to_string());
     let mut idx = 0usize;
     while let Some(url) = next_url.take() {
-        let Ok(pl_raw) = run_curl(&[&url, "-H", &auth_header], None) else {
+        validate_spotify_api_url(&url)?;
+        let Ok(pl_raw) = run_curl(&url, &[], Some(access_token), None) else {
             break;
         };
         let Ok(pl_val) = serde_json::from_str::<serde_json::Value>(&pl_raw) else {
@@ -1308,11 +1539,12 @@ pub fn fetch_profile_and_playlists(
 
 /// Fetches ALL tracks in a playlist or Liked Songs by following Spotify's `next` pagination URLs.
 pub fn fetch_playlist_tracks(access_token: &str, playlist_id: &str) -> Result<Vec<Track>, String> {
-    let auth_header = format!("Authorization: Bearer {access_token}");
+    let mut token = access_token.to_string();
+    let encoded_pid = url_encode(playlist_id);
     let first_url = if playlist_id == "liked-songs" {
         "https://api.spotify.com/v1/me/tracks?limit=50".to_string()
     } else {
-        format!("https://api.spotify.com/v1/playlists/{playlist_id}/items?limit=100")
+        format!("https://api.spotify.com/v1/playlists/{encoded_pid}/items?limit=100")
     };
 
     let mut tracks = Vec::new();
@@ -1321,18 +1553,22 @@ pub fn fetch_playlist_tracks(access_token: &str, playlist_id: &str) -> Result<Ve
     let mut tried_fallback = false;
 
     while let Some(url) = next_url.take() {
-        let raw = run_curl(&[&url, "-H", &auth_header], None)?;
-        let mut val: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|_| "Failed to parse tracks JSON".to_string())?;
-
-        if val.get("error").is_some() && playlist_id != "liked-songs" && !tried_fallback {
-            tried_fallback = true;
-            let fallback =
-                format!("https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100");
-            let raw2 = run_curl(&[&fallback, "-H", &auth_header], None)?;
-            val = serde_json::from_str(&raw2)
-                .map_err(|_| "Failed to parse tracks JSON".to_string())?;
-        }
+        validate_spotify_api_url(&url)?;
+        let val = match spotify_api_json(None, &url, &mut token, None) {
+            Ok(v) => v,
+            Err(err)
+                if playlist_id != "liked-songs"
+                    && !tried_fallback
+                    && !err.contains("Spotify API error (401)") =>
+            {
+                tried_fallback = true;
+                let fallback =
+                    format!("https://api.spotify.com/v1/playlists/{encoded_pid}/tracks?limit=100");
+                validate_spotify_api_url(&fallback)?;
+                spotify_api_json(None, &fallback, &mut token, None)?
+            }
+            Err(err) => return Err(err),
+        };
 
         if let Some(items) = val["items"].as_array() {
             for entry in items {
@@ -1397,6 +1633,28 @@ pub fn fetch_playlist_tracks(access_token: &str, playlist_id: &str) -> Result<Ve
     Ok(tracks)
 }
 
+fn encode_cover_jpeg_base64(cover_path: &Path) -> Result<String, String> {
+    let img = image::open(cover_path)
+        .map_err(|e| format!("Failed to open custom cover image: {e}"))?;
+    let img = if img.width() > 640 || img.height() > 640 {
+        img.resize(640, 640, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let rgb = img.to_rgb8();
+    for quality in [85u8, 70, 55, 40] {
+        let mut buf = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+        rgb.write_with_encoder(encoder)
+            .map_err(|e| format!("Failed to encode custom cover JPEG: {e}"))?;
+        let b64 = base64_encode_standard(&buf);
+        if b64.len() <= 256_000 {
+            return Ok(b64);
+        }
+    }
+    Err("Custom cover image exceeds Spotify's 256 KB JPEG upload limit.".into())
+}
+
 pub fn save_selection_to_spotify(
     access_token: &str,
     name: &str,
@@ -1409,7 +1667,7 @@ pub fn save_selection_to_spotify(
         return Ok("https://open.spotify.com".into());
     }
 
-    let auth_header = format!("Authorization: Bearer {access_token}");
+    let mut token = access_token.to_string();
     let create_body = serde_json::json!({
         "name": name,
         "description": description,
@@ -1417,82 +1675,122 @@ pub fn save_selection_to_spotify(
     })
     .to_string();
 
-    let created_raw = run_curl(
-        &[
-            "-X",
-            "POST",
-            "https://api.spotify.com/v1/me/playlists",
-            "-H",
-            &auth_header,
-            "-H",
-            "Content-Type: application/json",
-        ],
+    let created = spotify_api_json(
+        Some("POST"),
+        "https://api.spotify.com/v1/me/playlists",
+        &mut token,
         Some(create_body.as_bytes()),
     )?;
 
-    let created: serde_json::Value = serde_json::from_str(&created_raw)
-        .map_err(|_| format!("Failed to create playlist: {created_raw}"))?;
     let playlist_id = created["id"]
         .as_str()
-        .ok_or_else(|| format!("Spotify error creating playlist: {created_raw}"))?;
+        .ok_or_else(|| format!("Spotify error creating playlist: {created}"))?;
     let playlist_url = created["external_urls"]["spotify"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| format!("https://open.spotify.com/playlist/{playlist_id}"));
 
+    let encoded_pid = url_encode(playlist_id);
     let uris: Vec<&str> = tracks.iter().map(|t| t.uri.as_str()).collect();
     for batch in uris.chunks(100) {
         let add_body = serde_json::json!({ "uris": batch }).to_string();
-        let items_url = format!("https://api.spotify.com/v1/playlists/{playlist_id}/items");
-        let res = run_curl(
-            &[
-                "-X",
-                "POST",
-                &items_url,
-                "-H",
-                &auth_header,
-                "-H",
-                "Content-Type: application/json",
-            ],
+        let items_url = format!("https://api.spotify.com/v1/playlists/{encoded_pid}/items");
+        if let Err(err) = spotify_api_json(
+            Some("POST"),
+            &items_url,
+            &mut token,
             Some(add_body.as_bytes()),
-        );
-        if res.is_err() {
-            let fallback_url = format!("https://api.spotify.com/v1/playlists/{playlist_id}/tracks");
-            let _ = run_curl(
-                &[
-                    "-X",
-                    "POST",
-                    &fallback_url,
-                    "-H",
-                    &auth_header,
-                    "-H",
-                    "Content-Type: application/json",
-                ],
+        ) {
+            if err.contains("Spotify API error (401)") {
+                return Err(err);
+            }
+            let fallback_url =
+                format!("https://api.spotify.com/v1/playlists/{encoded_pid}/tracks");
+            spotify_api_json(
+                Some("POST"),
+                &fallback_url,
+                &mut token,
                 Some(add_body.as_bytes()),
-            );
+            )?;
         }
     }
 
-    if let Some(cover_path) = custom_cover_path
-        && let Ok(bytes) = std::fs::read(cover_path)
-    {
-        let b64 = base64_encode_standard(&bytes);
-        if b64.len() <= 256_000 {
-            let img_url = format!("https://api.spotify.com/v1/playlists/{playlist_id}/images");
-            let _ = run_curl(
-                &[
-                    "-X",
-                    "PUT",
-                    &img_url,
-                    "-H",
-                    &auth_header,
-                    "-H",
-                    "Content-Type: image/jpeg",
-                ],
-                Some(b64.as_bytes()),
-            );
-        }
+    if let Some(cover_path) = custom_cover_path {
+        let b64 = encode_cover_jpeg_base64(cover_path)?;
+        let img_url = format!("https://api.spotify.com/v1/playlists/{encoded_pid}/images");
+        spotify_api_request(
+            Some("PUT"),
+            &img_url,
+            Some("image/jpeg"),
+            &mut token,
+            Some(b64.as_bytes()),
+            true,
+        )?;
     }
 
     Ok(playlist_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_https_url_rejects_unsafe_and_accepts_https() {
+        assert!(validate_https_url("file:///etc/passwd").is_err());
+        assert!(validate_https_url("http://api.spotify.com/v1/me").is_err());
+        assert!(validate_https_url("-K").is_err());
+        assert!(validate_https_url("https://api.spotify.com/v1/me foo").is_err());
+        assert!(validate_https_url("https://api.spotify.com/v1/me\n").is_err());
+        assert!(validate_https_url("https://api.spotify.com/v1/me\r").is_err());
+        assert!(validate_https_url("https://").is_err());
+        assert!(validate_https_url("https:///v1/me").is_err());
+
+        assert!(validate_https_url("https://api.spotify.com/v1/me").is_ok());
+        assert!(
+            validate_https_url("https://open.spotify.com/oembed?url=https://open.spotify.com/track/123")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn prepare_pkce_request_produces_distinct_random_values_and_s256_url() {
+        let client_id = "0123456789abcdef0123456789abcdef";
+        let Ok(req1) = prepare_pkce_request(client_id) else {
+            panic!("first PKCE request failed");
+        };
+        let Ok(req2) = prepare_pkce_request(client_id) else {
+            panic!("second PKCE request failed");
+        };
+
+        assert!(!req1.verifier.is_empty());
+        assert!(!req1.state.is_empty());
+        assert_ne!(req1.verifier, req2.verifier);
+        assert_ne!(req1.state, req2.state);
+
+        assert!(req1.auth_url.starts_with("https://accounts.spotify.com/authorize?"));
+        assert!(req1.auth_url.contains("code_challenge_method=S256"));
+        let expected_challenge = base64_url_encode(&sha256(req1.verifier.as_bytes()));
+        assert!(
+            req1.auth_url
+                .contains(&format!("code_challenge={expected_challenge}"))
+        );
+        assert!(req1.auth_url.contains(&format!("state={}", req1.state)));
+    }
+
+    #[test]
+    fn exchange_callback_query_rejects_missing_or_mismatched_state() {
+        let Ok(req) = prepare_pkce_request("0123456789abcdef0123456789abcdef") else {
+            panic!("PKCE request failed");
+        };
+
+        let missing = exchange_callback_query(&req, "http://127.0.0.1:8888/callback?code=abc123");
+        assert!(missing.is_err());
+
+        let mismatched = exchange_callback_query(
+            &req,
+            "http://127.0.0.1:8888/callback?code=abc123&state=not-the-right-state",
+        );
+        assert!(mismatched.is_err());
+    }
 }

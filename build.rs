@@ -29,23 +29,40 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let rc_file = manifest_dir.join("assets").join("swipelist.rc");
-    let res_file = out_dir.join("swipelist.res");
+    let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") else {
+        println!("cargo:warning=CARGO_MANIFEST_DIR not set; skipping Windows icon embedding");
+        return;
+    };
+    let Ok(out_dir) = env::var("OUT_DIR") else {
+        println!("cargo:warning=OUT_DIR not set; skipping Windows icon embedding");
+        return;
+    };
+    let rc_file = PathBuf::from(manifest_dir).join("assets").join("swipelist.rc");
+    let res_file = PathBuf::from(out_dir).join("swipelist.res");
 
     if let Some(rc_exe) = find_rc_exe() {
-        let status = Command::new(rc_exe)
+        let status = match Command::new(rc_exe)
             .arg("/nologo")
             .arg("/fo")
             .arg(&res_file)
             .arg(&rc_file)
             .status()
-            .expect("failed to execute rc.exe");
+        {
+            Ok(status) => status,
+            Err(err) => {
+                println!(
+                    "cargo:warning=failed to execute rc.exe ({err}); skipping Windows icon embedding"
+                );
+                return;
+            }
+        };
         if status.success() {
             println!("cargo:rustc-link-arg-bins={}", res_file.display());
         } else {
-            panic!("rc.exe failed to compile {}", rc_file.display());
+            println!(
+                "cargo:warning=rc.exe failed to compile {} (status {status}); skipping Windows icon embedding",
+                rc_file.display()
+            );
         }
     } else {
         println!("cargo:warning=rc.exe not found; skipping Windows icon embedding");

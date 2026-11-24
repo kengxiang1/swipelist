@@ -7,6 +7,10 @@
 # User session & auto-saved progress
 swipelist_progress.json
 
+# Sensitive configuration & environment files
+config.json
+.env*
+
 # Logs & temporary files
 logs
 *.log
