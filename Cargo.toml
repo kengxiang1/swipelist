@@ -1,0 +1,129 @@
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "crates/rune",
+    "crates/rune-core",
+    "crates/rune-edit",
+    "crates/rune-gpu",
+    "crates/rune-image",
+    "crates/rune-media",
+    "crates/rune-motion",
+    "crates/rune-spell",
+    "crates/rune-staging",
+    "crates/rune-taffy",
+    "crates/rune-text",
+    "crates/procwatch",
+]
+default-members = ["."]
+exclude = [
+    "vendor/accesskit_macos",
+    "vendor/accesskit_windows",
+    "vendor/parley_engine",
+    "vendor/sctk-adwaita",
+    "vendor/tiny-skia-path",
+    "vendor/wgpu-hal",
+    "vendor/winit",
+]
+
+[package]
+name = "swipelist"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Tinder-style Spotify playlist curator built in Rust with Rune (wgpu)"
+
+[dependencies]
+rune = { workspace = true, default-features = true, features = ["native-file-dialog"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+image = { workspace = true, features = ["png", "jpeg"] }
+
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
+winit = { path = "vendor/winit" }
+sctk-adwaita = { path = "vendor/sctk-adwaita" }
+parley_engine = { path = "vendor/parley_engine" }
+accesskit_windows = { path = "vendor/accesskit_windows" }
+accesskit_macos = { path = "vendor/accesskit_macos" }
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+procwatch = { path = "crates/procwatch" }
+rune = { path = "crates/rune", default-features = false }
+rune-core = { path = "crates/rune-core" }
+rune-edit = { path = "crates/rune-edit" }
+rune-gpu = { path = "crates/rune-gpu", default-features = false }
+rune-image = { path = "crates/rune-image", default-features = false }
+rune-media = { path = "crates/rune-media", default-features = false }
+rune-motion = { path = "crates/rune-motion" }
+rune-spell = { path = "crates/rune-spell" }
+rune-staging = { path = "crates/rune-staging" }
+rune-taffy = { path = "crates/rune-taffy" }
+rune-text = { path = "crates/rune-text", default-features = false }
+
+blake3 = "1"
+block2 = "0.6"
+bytemuck = { version = "1.25", features = ["derive"] }
+half = "2"
+image = { version = "0.25", default-features = false }
+js-sys = "0.3"
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false }
+objc2-core-foundation = { version = "0.3", default-features = false }
+objc2-core-graphics = { version = "0.3", default-features = false }
+objc2-core-video = { version = "0.3", default-features = false }
+objc2-foundation = { version = "0.3", default-features = false }
+objc2-metal = { version = "0.3", default-features = false }
+parley = { version = "0.12", default-features = false }
+parley_engine = { version = "0.12", default-features = false }
+png = "0.18"
+pollster = "1"
+resvg = { version = "0.45", default-features = false }
+rustc-hash = "2"
+serde = "1"
+serde_json = "1"
+swash = "0.2.10"
+taffy = { version = "0.15", default-features = false }
+unicode-segmentation = "1.13"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
+wgpu = { version = "~30.0.1", default-features = false }
+wgpu-naga-bridge = "~30.0.1"
+windows = "0.62"
+windows-core = "0.62"
+windows-sys = "0.61"
+winit = { version = "0.30.13", default-features = false }
+zeroize = "1.8"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+codegen-units = 16
+incremental = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unsafe_code = "allow"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+dbg_macro = "deny"
+disallowed_types = "deny"
+expect_used = "warn"
+todo = "warn"
+unwrap_used = "warn"
+undocumented_unsafe_blocks = "warn"
+let_underscore_must_use = "deny"
+disallowed_methods = "deny"

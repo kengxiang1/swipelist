@@ -1,0 +1,23 @@
+# Rust build outputs & Windows binaries
+/target/
+*.exe
+*.pdb
+*.lnk
+
+# User session & auto-saved progress
+swipelist_progress.json
+
+# Logs & temporary files
+logs
+*.log
+*.local
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
