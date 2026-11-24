@@ -1474,11 +1474,15 @@ fn left_sidebar(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                         .role("button")
                         .label("Change Source")
                         .h(22.0)
-                        .px(9.0)
-                        .radius(11.0)
+                        .px(4.0)
+                        .radius(5.0)
                         .center_y()
-                        .fill(p.add_green_soft)
+                        .fill(Color::TRANSPARENT)
                         .hover(p.hover_fill)
+                        .hover_motion(
+                            Curve::tween(0.09, Easing::cubic(0.42, 0.0, 0.58, 1.0)),
+                            Curve::tween(0.11, Easing::cubic(0.42, 0.0, 0.58, 1.0)),
+                        )
                         .press(p.press_fill)
                         .press_scale(0.95)
                         .cursor(Cursor::Pointer)
