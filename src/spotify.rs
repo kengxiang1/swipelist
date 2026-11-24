@@ -73,6 +73,8 @@ pub struct UserProfile {
     pub id: String,
     pub display_name: String,
     pub product: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1220,6 +1222,11 @@ pub fn fetch_profile_and_playlists(
             .unwrap_or("Spotify User")
             .to_string(),
         product: me["product"].as_str().unwrap_or("premium").to_uppercase(),
+        image_url: me["images"]
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|img| img["url"].as_str())
+            .map(String::from),
     };
 
     let mut list = Vec::new();

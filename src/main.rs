@@ -219,6 +219,7 @@ struct State {
     progress_store: ProgressStore,
 
     // Cover Art Cache
+    user_avatar: Option<Image>,
     track_covers: HashMap<String, Image>,
     playlist_covers: HashMap<String, Image>,
     requested_covers: HashSet<String>,
@@ -322,6 +323,7 @@ impl Default for State {
 
             progress_store: ProgressStore::default(),
 
+            user_avatar: None,
             track_covers: HashMap::new(),
             playlist_covers: HashMap::new(),
             requested_covers: HashSet::new(),
@@ -610,11 +612,27 @@ impl State {
         self.auto_save_progress();
     }
 
-    /// Queues background cover-art downloads for visible cards, selected songs, and source playlists.
+    /// Queues background cover-art downloads for user avatar, visible cards, selected songs, and source playlists.
     fn queue_visible_covers(&mut self) {
         let Some(tx) = &self.cover_tx else {
             return;
         };
+
+        // 0. Spotify user profile avatar
+        if let Some(user) = &self.user
+            && let Some(url) = &user.image_url
+        {
+            let key = format!("avatar:{}", user.id);
+            if !self.requested_covers.contains(&key) {
+                self.requested_covers.insert(key);
+                let _ = tx.send(CoverJob {
+                    id: "__user_avatar__".to_string(),
+                    is_playlist: false,
+                    image_url: Some(url.clone()),
+                    spotify_track_id: None,
+                });
+            }
+        }
 
         // 1. Current & upcoming 5 tracks in swipe deck
         for i in self.current_index..=(self.current_index + 5).min(self.tracks.len().saturating_sub(1)) {
@@ -1034,7 +1052,9 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     if let (Some(rx), Some(cache)) = (&s.cover_rx, &s.image_cache) {
         while let Ok(loaded) = rx.try_recv() {
             let img = cache.load(loaded.bytes);
-            if loaded.is_playlist {
+            if loaded.id == "__user_avatar__" {
+                s.user_avatar = Some(img);
+            } else if loaded.is_playlist {
                 s.playlist_covers.insert(loaded.id, img);
             } else {
                 s.track_covers.insert(loaded.id, img);
@@ -1325,11 +1345,87 @@ fn left_sidebar(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
     let count = s.selected_tracks.len();
     let duration_str = format_total_duration(&s.selected_tracks);
 
-    // 1. Flat Brand Header + Flat Spotify Status Pill
-    let auth_label = match &s.user {
-        Some(u) => u.display_name.clone(),
-        None => "Connect Spotify".into(),
+    // 1. Flat Brand Header + Circular Spotify Profile Picture (or Connect Spotify Pill)
+    let auth_control = if let Some(user) = &s.user {
+        let initial = user
+            .display_name
+            .chars()
+            .next()
+            .unwrap_or('S')
+            .to_uppercase()
+            .to_string();
+        let avatar_hovered = s.hovered_btn == Some("user-avatar");
+        let hover_in = Curve::tween(0.09, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+        let hover_out = Curve::tween(0.11, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+        let bounce = Spring::new(0.18, 0.30);
+
+        let mut avatar = el()
+            .key("btn-connect-spotify")
+            .role("button")
+            .label(format!("{} • Spotify Account", user.display_name))
+            .help(format!("{} • Spotify Account", user.display_name))
+            .size(34.0, 34.0)
+            .radius(17.0)
+            .clip_rounded(17.0)
+            .center()
+            .scale(if avatar_hovered { 1.10 } else { 1.0 })
+            .fill(p.add_green_soft)
+            .hover(p.hover_fill)
+            .hover_motion(hover_in, hover_out)
+            .motion(bounce)
+            .press_scale(0.93)
+            .cursor(Cursor::Pointer)
+            .on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+                if inside {
+                    s.hovered_btn = Some("user-avatar");
+                } else if s.hovered_btn == Some("user-avatar") {
+                    s.hovered_btn = None;
+                }
+                tx.animated();
+            })
+            .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                s.open_auth_modal();
+                tx.animated();
+            });
+
+        if let Some(img) = &s.user_avatar {
+            avatar = avatar.pixels_fit(img.pixels(), SurfaceFit::Fill);
+        } else {
+            avatar = avatar.child(
+                text(initial)
+                    .font(TextStyle::new(14.0, 800.0))
+                    .color(p.add_green),
+            );
+        }
+        avatar
+    } else {
+        row()
+            .key("btn-connect-spotify")
+            .role("button")
+            .label("Connect Spotify")
+            .h(30.0)
+            .px(12.0)
+            .radius(15.0)
+            .center_y()
+            .gap(7.0)
+            .fill(p.bg_flat_block)
+            .hover(p.hover_fill)
+            .press(p.press_fill)
+            .press_scale(0.96)
+            .cursor(Cursor::Pointer)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                s.open_auth_modal();
+                tx.animated();
+            })
+            .child(el().size(7.0, 7.0).radius(3.5).fill(p.undo_amber))
+            .child(
+                text("Connect Spotify")
+                    .font(TextStyle::new(11.5, 650.0))
+                    .color(p.text_primary)
+                    .truncate(),
+            )
     };
+
     let brand_row = row()
         .key("sidebar-brand-row")
         .w_full()
@@ -1352,49 +1448,7 @@ fn left_sidebar(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                         .color(p.text_primary),
                 ),
         )
-        .child(
-            row()
-                .key("btn-connect-spotify")
-                .role("button")
-                .label(&auth_label)
-                .h(30.0)
-                .px(12.0)
-                .radius(15.0)
-                .center_y()
-                .gap(7.0)
-                .fill(if s.user.is_some() {
-                    p.add_green_soft
-                } else {
-                    p.bg_flat_block
-                })
-                .hover(p.hover_fill)
-                .press(p.press_fill)
-                .press_scale(0.96)
-                .cursor(Cursor::Pointer)
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                    s.open_auth_modal();
-                    tx.animated();
-                })
-                .child(
-                    el().size(7.0, 7.0)
-                        .radius(3.5)
-                        .fill(if s.user.is_some() {
-                            p.add_green
-                        } else {
-                            p.undo_amber
-                        }),
-                )
-                .child(
-                    text(auth_label)
-                        .font(TextStyle::new(11.5, 650.0))
-                        .color(if s.user.is_some() {
-                            p.add_green
-                        } else {
-                            p.text_primary
-                        })
-                        .truncate(),
-                ),
-        );
+        .child(auth_control);
 
     // 2. Flat Source Playlist Block
     let source_block = col()
