@@ -57,6 +57,43 @@ pub(crate) fn hwnd(window: &winit::window::Window) -> Option<HWND> {
     Some(h.hwnd.get() as HWND)
 }
 
+/// Applies the executable's embedded Win32 icon resource (ID 1) to `window`'s titlebar and taskbar icon.
+pub(crate) fn apply_exe_icon(window: &winit::window::Window) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    let Some(hwnd) = hwnd(window) else { return };
+    // SAFETY: Loads embedded icon resource ID 1 (if present) from the current executable module
+    // and assigns it to the window via WM_SETICON.
+    unsafe {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        if hinst.is_null() {
+            return;
+        }
+        let res_id = 1usize as *const u16;
+        let big = LoadImageW(
+            hinst,
+            res_id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        );
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
+        }
+        let small = LoadImageW(
+            hinst,
+            res_id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR | LR_SHARED,
+        );
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+        }
+    }
+}
+
 /// When the display shows its next refresh after `now`, from DWM's timing (`now` plus a 60 Hz
 /// frame when DWM won't say).
 pub(crate) fn next_vblank(now: std::time::Instant) -> std::time::Instant {

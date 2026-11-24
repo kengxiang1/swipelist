@@ -77,6 +77,8 @@ impl Host {
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
         crate::marks::mark("window.native");
         #[cfg(target_os = "windows")]
+        crate::platform::win32::apply_exe_icon(&window);
+        #[cfg(target_os = "windows")]
         crate::platform::win32::follow_suggested_rect(&window);
         #[cfg(target_os = "windows")]
         crate::platform::win32::press_point::install(&window);
