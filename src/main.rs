@@ -1608,9 +1608,9 @@ fn left_sidebar(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
             )
     } else {
         let mut list = col().key("selected-rows").w_full().gap(2.0);
-        let ease_in_out_in = Curve::tween(0.20, Easing::cubic(0.42, 0.0, 0.58, 1.0));
-        let ease_in_out_out = Curve::tween(0.18, Easing::cubic(0.42, 0.0, 0.58, 1.0));
-        let hover_bounce_spring = Spring::new(0.28, 0.34);
+        let ease_in_out_in = Curve::tween(0.09, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+        let ease_in_out_out = Curve::tween(0.11, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+        let hover_bounce_spring = Spring::new(0.18, 0.28);
 
         for track in s.selected_tracks.iter().rev() {
             let track_id = track.id.clone();
