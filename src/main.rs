@@ -206,6 +206,7 @@ struct State {
     // Selected Songs & New Playlist configuration
     selected_tracks: Vec<Track>,
     hovered_selected_id: Option<String>,
+    hovered_btn: Option<&'static str>,
     new_playlist_name: TextEdit,
     new_playlist_desc: TextEdit,
     is_public: bool,
@@ -310,6 +311,7 @@ impl Default for State {
 
             selected_tracks,
             hovered_selected_id: None,
+            hovered_btn: None,
             new_playlist_name: TextEdit::new(default_new_name),
             new_playlist_desc: TextEdit::new("Curated with Swipelist"),
             is_public: false,
@@ -2236,11 +2238,37 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
         );
     }
 
-    // Flat Tinder Floating Action Dock — Apple §8: Hint in the direction of the gesture
+    // Flat Tinder Floating Action Dock — Apple §8: Hint in the direction of the gesture + bouncy hover
     let can_undo = !s.history.is_empty();
     let track_url = active_track.spotify_url();
     let add_hint_scale = 1.0 + (s.drag_dx / 120.0).clamp(0.0, 1.0) * 0.13;
     let skip_hint_scale = 1.0 + (-s.drag_dx / 120.0).clamp(0.0, 1.0) * 0.13;
+    let btn_hover_in = Curve::tween(0.09, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+    let btn_hover_out = Curve::tween(0.11, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+    let btn_bounce = Spring::new(0.18, 0.30);
+
+    let undo_scale = if can_undo && s.hovered_btn == Some("dock-undo") {
+        1.10
+    } else {
+        1.0
+    };
+    let skip_scale = skip_hint_scale
+        * if s.hovered_btn == Some("dock-skip") {
+            1.10
+        } else {
+            1.0
+        };
+    let add_scale = add_hint_scale
+        * if s.hovered_btn == Some("dock-add") {
+            1.10
+        } else {
+            1.0
+        };
+    let open_scale = if s.hovered_btn == Some("dock-open") {
+        1.10
+    } else {
+        1.0
+    };
 
     let action_dock = row()
         .key("tinder-action-dock")
@@ -2255,22 +2283,32 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                 .size(m.dock_sm, m.dock_sm)
                 .radius(m.dock_sm / 2.0)
                 .center()
+                .scale(undo_scale)
                 .fill(if can_undo {
                     p.undo_amber_soft
                 } else {
                     p.bg_card
                 })
                 .hover(if can_undo {
-                    p.hover_fill
+                    oklcha(0.80, 0.17, 75.0, 0.26)
                 } else {
                     Color::TRANSPARENT
                 })
-                .motion(apple_spring_snappy())
+                .hover_motion(btn_hover_in, btn_hover_out)
+                .motion(btn_bounce)
                 .press_scale(if can_undo { 0.92 } else { 1.0 })
                 .cursor(if can_undo {
                     Cursor::Pointer
                 } else {
                     Cursor::Default
+                })
+                .on_hover_change(move |s: &mut State, inside: bool, tx: &mut Tx| {
+                    if inside && can_undo {
+                        s.hovered_btn = Some("dock-undo");
+                    } else if s.hovered_btn == Some("dock-undo") {
+                        s.hovered_btn = None;
+                    }
+                    tx.animated();
                 })
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     s.undo_last_swipe();
@@ -2281,7 +2319,7 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                     if can_undo { p.undo_amber } else { p.text_muted },
                 )),
         )
-        // 2. Large SKIP Button (grows subtly as you drag left)
+        // 2. Large SKIP Button (grows subtly as you drag left or hover)
         .child(
             el().key("btn-dock-skip")
                 .role("button")
@@ -2290,19 +2328,28 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                 .size(m.dock_lg, m.dock_lg)
                 .radius(m.dock_lg / 2.0)
                 .center()
-                .scale(skip_hint_scale)
-                .motion(apple_spring_snappy())
+                .scale(skip_scale)
+                .motion(btn_bounce)
                 .fill(p.skip_coral_soft)
-                .hover(oklcha(0.68, 0.22, 18.0, 0.24))
+                .hover(oklcha(0.68, 0.22, 18.0, 0.28))
+                .hover_motion(btn_hover_in, btn_hover_out)
                 .press_scale(0.91)
                 .cursor(Cursor::Pointer)
+                .on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+                    if inside {
+                        s.hovered_btn = Some("dock-skip");
+                    } else if s.hovered_btn == Some("dock-skip") {
+                        s.hovered_btn = None;
+                    }
+                    tx.animated();
+                })
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     s.commit_swipe(SwipeDecision::Skip);
                     tx.animated();
                 })
                 .child(x_icon((27.0 * m.scale).round(), 2.8, p.skip_coral)),
         )
-        // 3. Large ADD Button (grows subtly as you drag right)
+        // 3. Large ADD Button (grows subtly as you drag right or hover)
         .child(
             el().key("btn-dock-add")
                 .role("button")
@@ -2311,11 +2358,21 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                 .size(m.dock_lg, m.dock_lg)
                 .radius(m.dock_lg / 2.0)
                 .center()
-                .scale(add_hint_scale)
-                .motion(apple_spring_snappy())
+                .scale(add_scale)
+                .motion(btn_bounce)
                 .fill(p.add_green)
+                .hover(oklch(0.82, 0.21, 152.0))
+                .hover_motion(btn_hover_in, btn_hover_out)
                 .press_scale(0.91)
                 .cursor(Cursor::Pointer)
+                .on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+                    if inside {
+                        s.hovered_btn = Some("dock-add");
+                    } else if s.hovered_btn == Some("dock-add") {
+                        s.hovered_btn = None;
+                    }
+                    tx.animated();
+                })
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     s.commit_swipe(SwipeDecision::Add);
                     tx.animated();
@@ -2331,11 +2388,21 @@ fn swiping_stage_view(s: &State, p: &Palette, m: &LayoutMetrics) -> El {
                 .size(m.dock_sm, m.dock_sm)
                 .radius(m.dock_sm / 2.0)
                 .center()
-                .motion(apple_spring_snappy())
+                .scale(open_scale)
+                .motion(btn_bounce)
                 .fill(p.bg_card)
-                .hover(p.hover_fill)
+                .hover(oklcha(1.0, 0.0, 0.0, 0.12))
+                .hover_motion(btn_hover_in, btn_hover_out)
                 .press_scale(0.92)
                 .cursor(Cursor::Pointer)
+                .on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+                    if inside {
+                        s.hovered_btn = Some("dock-open");
+                    } else if s.hovered_btn == Some("dock-open") {
+                        s.hovered_btn = None;
+                    }
+                    tx.animated();
+                })
                 .on_press_tx(move |_: &mut State, tx: &mut Tx| {
                     let _ = tx.open_url(&track_url);
                 })
@@ -2682,60 +2749,100 @@ fn tinder_track_card(
         });
     }
 
+    let card_btn_hover_in = Curve::tween(0.09, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+    let card_btn_hover_out = Curve::tween(0.11, Easing::cubic(0.42, 0.0, 0.58, 1.0));
+    let card_btn_bounce = Spring::new(0.18, 0.30);
+    let mute_hovered = is_top && s.hovered_btn == Some("card-mute");
+    let play_hovered = is_top && s.hovered_btn == Some("card-play");
+
+    let mut mute_btn = el()
+        .key(format!("btn-card-mute-{}", track.id))
+        .role("button")
+        .label(if s.muted || effective_vol <= 0.005 {
+            "Unmute"
+        } else {
+            "Mute"
+        })
+        .size(26.0, 26.0)
+        .radius(13.0)
+        .center()
+        .scale(if mute_hovered { 1.12 } else { 1.0 })
+        .hover(Color::WHITE.alpha(0.14))
+        .hover_motion(card_btn_hover_in, card_btn_hover_out)
+        .motion(card_btn_bounce)
+        .press_scale(0.90)
+        .cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            s.toggle_mute();
+        })
+        .child(volume_icon(
+            16.0,
+            if mute_hovered {
+                Color::WHITE
+            } else {
+                Color::WHITE.alpha(0.84)
+            },
+            effective_vol,
+            s.muted,
+        ));
+    if is_top {
+        mute_btn = mute_btn.on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+            if inside {
+                s.hovered_btn = Some("card-mute");
+            } else if s.hovered_btn == Some("card-mute") {
+                s.hovered_btn = None;
+            }
+            tx.animated();
+        });
+    }
+
     let volume_group = row()
         .key(format!("card-volume-group-{}", track.id))
         .center_y()
         .gap(6.0)
-        .child(
-            el().key(format!("btn-card-mute-{}", track.id))
-                .role("button")
-                .label(if s.muted || effective_vol <= 0.005 {
-                    "Unmute"
-                } else {
-                    "Mute"
-                })
-                .size(24.0, 24.0)
-                .radius(12.0)
-                .center()
-                .hover(Color::WHITE.alpha(0.10))
-                .cursor(Cursor::Pointer)
-                .on_press(|s: &mut State| {
-                    s.toggle_mute();
-                })
-                .child(volume_icon(
-                    16.0,
-                    Color::WHITE.alpha(0.84),
-                    effective_vol,
-                    s.muted,
-                )),
-        )
+        .child(mute_btn)
         .child(vol_slider_el);
 
     // 3. Combined Spotify-style Player Block (Transport + Volume on Row 1, Progress Scrubber on Row 2)
     let play_btn_d = (32.0 * m.scale).clamp(30.0, 42.0).round();
-    let mut controls_left = row().center_y().gap(10.0).child(
-        el().key(format!("btn-card-play-{}", track.id))
-            .role("button")
-            .label(if is_this_playing {
-                "Pause preview"
-            } else {
-                "Play preview"
-            })
-            .size(play_btn_d, play_btn_d)
-            .radius(play_btn_d / 2.0)
-            .center()
-            .fill(Color::WHITE)
-            .press_scale(0.93)
-            .cursor(Cursor::Pointer)
-            .on_press(|s: &mut State| {
-                s.toggle_play_current_track();
-            })
-            .child(if is_this_playing {
-                pause_icon((14.0 * m.scale).round(), Color::BLACK)
-            } else {
-                play_icon((14.0 * m.scale).round(), Color::BLACK)
-            }),
-    );
+    let mut play_btn = el()
+        .key(format!("btn-card-play-{}", track.id))
+        .role("button")
+        .label(if is_this_playing {
+            "Pause preview"
+        } else {
+            "Play preview"
+        })
+        .size(play_btn_d, play_btn_d)
+        .radius(play_btn_d / 2.0)
+        .center()
+        .scale(if play_hovered { 1.10 } else { 1.0 })
+        .fill(Color::WHITE)
+        .hover(Color::WHITE.alpha(0.92))
+        .hover_motion(card_btn_hover_in, card_btn_hover_out)
+        .motion(card_btn_bounce)
+        .press_scale(0.93)
+        .cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            s.toggle_play_current_track();
+        })
+        .child(if is_this_playing {
+            pause_icon((14.0 * m.scale).round(), Color::BLACK)
+        } else {
+            play_icon((14.0 * m.scale).round(), Color::BLACK)
+        });
+    if is_top {
+        play_btn = play_btn.on_hover_change(|s: &mut State, inside: bool, tx: &mut Tx| {
+            if inside {
+                s.hovered_btn = Some("card-play");
+            } else if s.hovered_btn == Some("card-play") {
+                s.hovered_btn = None;
+            }
+            tx.animated();
+        });
+    }
+
+    let mut controls_left = row().center_y().gap(10.0).child(play_btn);
 
     if is_this_loading {
         controls_left = controls_left.child(
